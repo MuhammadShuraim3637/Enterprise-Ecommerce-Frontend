@@ -778,7 +778,6 @@ function CategoriesTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string
 // ---------------------------------------------------------------------------
 // Products
 // ---------------------------------------------------------------------------
-
 function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) => void }) {
   const [products, setProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(false);
@@ -988,18 +987,18 @@ function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) 
                           </Badge>
                         )}
                         {auth.user?.is_superuser && (
-                          <div className="absolute -bottom-7 left-0 right-0 flex justify-center gap-1">
+                          <div className="absolute -bottom-7 left-0 right-0 flex justify-center gap-1 pointer-events-none">
                             {!img.is_primary && (
                               <button
                                 onClick={() => handleSetPrimaryImage(img.id, p.id)}
-                                className="rounded bg-teal-600 px-2 py-1 text-[9px] font-medium text-white hover:bg-teal-700"
+                                className="pointer-events-auto rounded bg-teal-600 px-2 py-1 text-[9px] font-medium text-white hover:bg-teal-700"
                               >
                                 Set Primary
                               </button>
                             )}
                             <button
                               onClick={() => handleDeleteImage(img.id, p.id)}
-                              className="rounded bg-rose-600 px-2 py-1 text-[9px] font-medium text-white hover:bg-rose-700"
+                              className="pointer-events-auto rounded bg-rose-600 px-2 py-1 text-[9px] font-medium text-white hover:bg-rose-700"
                             >
                               Delete
                             </button>
@@ -1082,7 +1081,6 @@ function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) 
     </div>
   );
 }
-
 // ---------------------------------------------------------------------------
 // Cart
 // ---------------------------------------------------------------------------
