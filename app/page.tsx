@@ -310,12 +310,33 @@ function Badge({ children, tone = 'slate', className = '' }: { children: React.R
 // Main component
 // ---------------------------------------------------------------------------
 
+const navItems: { id: Tab; label: string; adminOnly?: boolean; requiresAuth?: boolean }[] = [
+  { id: 'overview', label: 'Overview' },
+  { id: 'auth', label: 'Authentication' },
+  { id: 'categories', label: 'Categories' },
+  { id: 'products', label: 'Products' },
+  { id: 'cart', label: 'Cart', requiresAuth: true },
+  { id: 'orders', label: 'Orders', requiresAuth: true },
+  { id: 'payments', label: 'Payments', requiresAuth: true },
+  { id: 'reviews', label: 'Reviews' },
+  { id: 'users', label: 'Users', requiresAuth: true, adminOnly: true },
+  { id: 'live', label: 'Live (WebSocket)', requiresAuth: true },
+];
+
 export default function ApiConsolePage() {
   const [health, setHealth] = useState<Health>('checking');
   const [auth, setAuth] = useState<AuthState>({ accessToken: null, user: null });
   const [tab, setTab] = useState<Tab>('overview');
   const [log, setLog] = useState<string[]>([]);
   const [restoringSession, setRestoringSession] = useState(true);
+
+  // Helper to change tab and save to localStorage
+  const changeTab = useCallback((newTab: Tab) => {
+    setTab(newTab);
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('ecommerce_console_tab', newTab);
+    }
+  }, []);
 
   const pushLog = useCallback((line: string) => {
     setLog((prev) => [`${new Date().toLocaleTimeString()}  ${line}`, ...prev].slice(0, 12));
@@ -334,6 +355,21 @@ export default function ApiConsolePage() {
     setAuth({ accessToken: token, user: me });
     return me;
   }
+
+  // Restore tab from localStorage on mount
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const savedTab = window.localStorage.getItem('ecommerce_console_tab') as Tab;
+      if (savedTab) {
+        const validTabs: Tab[] = [
+          'overview', 'auth', 'categories', 'products', 'cart', 'orders', 'payments', 'reviews', 'users', 'live'
+        ];
+        if (validTabs.includes(savedTab)) {
+          setTab(savedTab);
+        }
+      }
+    }
+  }, []);
 
   // On mount: if a refresh token was saved from a previous session, silently
   // mint a new access token instead of forcing the user to log in again.
@@ -361,6 +397,21 @@ export default function ApiConsolePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Redirect to safe tabs if permissions are not met after session restore completes
+  useEffect(() => {
+    if (restoringSession) return;
+    const currentItem = navItems.find((item) => item.id === tab);
+    if (!currentItem) return;
+
+    if (currentItem.requiresAuth && !auth.accessToken) {
+      changeTab('auth');
+      pushLog(`Redirected from "${currentItem.label}" to Authentication (login required)`);
+    } else if (currentItem.adminOnly && !auth.user?.is_superuser) {
+      changeTab('overview');
+      pushLog(`Redirected from "${currentItem.label}" to Overview (admin access required)`);
+    }
+  }, [restoringSession, auth.accessToken, auth.user, tab, changeTab, pushLog]);
+
   function handleLoginSuccess(accessToken: string, refreshToken: string, user: UserProfile) {
     window.localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
     setAuth({ accessToken, user });
@@ -378,21 +429,8 @@ export default function ApiConsolePage() {
     window.localStorage.removeItem(REFRESH_TOKEN_KEY);
     setAuth({ accessToken: null, user: null });
     pushLog('Logged out');
-    setTab('auth');
+    changeTab('auth');
   }
-
-  const navItems: { id: Tab; label: string; adminOnly?: boolean; requiresAuth?: boolean }[] = [
-    { id: 'overview', label: 'Overview' },
-    { id: 'auth', label: 'Authentication' },
-    { id: 'categories', label: 'Categories' },
-    { id: 'products', label: 'Products' },
-    { id: 'cart', label: 'Cart', requiresAuth: true },
-    { id: 'orders', label: 'Orders', requiresAuth: true },
-    { id: 'payments', label: 'Payments', requiresAuth: true },
-    { id: 'reviews', label: 'Reviews' },
-    { id: 'users', label: 'Users', requiresAuth: true, adminOnly: true },
-    { id: 'live', label: 'Live (WebSocket)', requiresAuth: true },
-  ];
 
   return (
     <div className="flex min-h-screen bg-slate-50 text-slate-900">
@@ -415,7 +453,7 @@ export default function ApiConsolePage() {
             return (
               <button
                 key={item.id}
-                onClick={() => setTab(item.id)}
+                onClick={() => changeTab(item.id)}
                 className={`block w-full rounded-md px-3 py-2 text-left text-sm transition ${
                   tab === item.id
                     ? 'bg-slate-900 text-white'
