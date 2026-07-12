@@ -4,7 +4,7 @@
  * Full API Console — a single-file Next.js dashboard covering every endpoint
  * of the enterprise-ecommerce FastAPI backend: auth, categories, products
  * (incl. image upload), cart, orders, payments, reviews, admin users, and a
- * live WebSocket tab (chat + real-time order updates).
+ * live WebSocket connection (chat + real-time order updates).
  *
  * Drop this in as: app/page.tsx  (Next.js App Router)
  * Requires: Tailwind CSS already configured in the project.
@@ -14,11 +14,14 @@
  *
  *   NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
  *
- * NOTE on OrderStatus: the exact enum values weren't available at the time
- * this file was generated, so the status dropdown assumes:
- *   pending | processing | shipped | delivered | cancelled
- * If your `app/models/order.py` OrderStatus enum uses different values,
- * update the ORDER_STATUSES array below.
+ * NOTE on OrderStatus: pending | processing | shipped | delivered | cancelled
+ * — matches app/models/order.py OrderStatus enum.
+ *
+ * ARCHITECTURE NOTE: the WebSocket connection lives at the top level
+ * (ApiConsolePage), not inside the Live tab. It auto-connects once the user
+ * is logged in and stays open regardless of which tab is active. This is
+ * what makes order-status updates appear on the Orders tab in real time
+ * without needing to visit the Live tab or refresh the page.
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
@@ -137,6 +140,11 @@ type Tab =
 interface AuthState {
   accessToken: string | null;
   user: UserProfile | null;
+}
+
+interface IncomingChat {
+  from: string;
+  message: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +281,7 @@ function Select({
 function Button({
   children,
   variant = 'primary',
+  type = 'button',
   ...props
 }: React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: 'primary' | 'ghost' | 'danger' }) {
   const base =
@@ -284,7 +293,7 @@ function Button({
       ? 'border border-rose-300 text-rose-600 hover:bg-rose-50'
       : 'border border-slate-300 text-slate-600 hover:border-slate-400 hover:text-slate-900';
   return (
-    <button {...props} className={`${base} ${styles} ${props.className || ''}`}>
+    <button type={type} {...props} className={`${base} ${styles} ${props.className || ''}`}>
       {children}
     </button>
   );
@@ -307,7 +316,7 @@ function Badge({ children, tone = 'slate', className = '' }: { children: React.R
 }
 
 // ---------------------------------------------------------------------------
-// Main component
+// Nav config
 // ---------------------------------------------------------------------------
 
 const navItems: { id: Tab; label: string; adminOnly?: boolean; requiresAuth?: boolean }[] = [
@@ -323,6 +332,10 @@ const navItems: { id: Tab; label: string; adminOnly?: boolean; requiresAuth?: bo
   { id: 'live', label: 'Live (WebSocket)', requiresAuth: true },
 ];
 
+// ---------------------------------------------------------------------------
+// Main component
+// ---------------------------------------------------------------------------
+
 export default function ApiConsolePage() {
   const [health, setHealth] = useState<Health>('checking');
   const [auth, setAuth] = useState<AuthState>({ accessToken: null, user: null });
@@ -330,7 +343,13 @@ export default function ApiConsolePage() {
   const [log, setLog] = useState<string[]>([]);
   const [restoringSession, setRestoringSession] = useState(true);
 
-  // Helper to change tab and save to localStorage
+  // --- Top-level WebSocket state (persists across tab switches) ---
+  const wsRef = useRef<WebSocket | null>(null);
+  const [wsConnected, setWsConnected] = useState(false);
+  const [liveMessages, setLiveMessages] = useState<string[]>([]);
+  const [incomingChats, setIncomingChats] = useState<IncomingChat[]>([]);
+  const [ordersRefreshKey, setOrdersRefreshKey] = useState(0);
+
   const changeTab = useCallback((newTab: Tab) => {
     setTab(newTab);
     if (typeof window !== 'undefined') {
@@ -362,7 +381,7 @@ export default function ApiConsolePage() {
       const savedTab = window.localStorage.getItem('ecommerce_console_tab') as Tab;
       if (savedTab) {
         const validTabs: Tab[] = [
-          'overview', 'auth', 'categories', 'products', 'cart', 'orders', 'payments', 'reviews', 'users', 'live'
+          'overview', 'auth', 'categories', 'products', 'cart', 'orders', 'payments', 'reviews', 'users', 'live',
         ];
         if (validTabs.includes(savedTab)) {
           setTab(savedTab);
@@ -373,8 +392,6 @@ export default function ApiConsolePage() {
 
   // On mount: if a refresh token was saved from a previous session, silently
   // mint a new access token instead of forcing the user to log in again.
-  // Only the refresh token ever touches localStorage — the access token stays
-  // in memory only, same as before.
   useEffect(() => {
     const savedRefreshToken = window.localStorage.getItem(REFRESH_TOKEN_KEY);
     if (!savedRefreshToken) {
@@ -412,6 +429,82 @@ export default function ApiConsolePage() {
     }
   }, [restoringSession, auth.accessToken, auth.user, tab, changeTab, pushLog]);
 
+  // --- WebSocket: connect automatically whenever we have an access token,
+  // disconnect when logged out. This keeps a single persistent connection
+  // alive no matter which tab is currently active. ---
+  const connectWebSocket = useCallback(() => {
+    if (!auth.accessToken || wsRef.current) return;
+    const wsBase = API_URL.replace(/^http/, 'ws');
+    const ws = new WebSocket(`${wsBase}/ws?token=${auth.accessToken}`);
+
+    ws.onopen = () => {
+      setWsConnected(true);
+      pushLog('WebSocket connected');
+      setLiveMessages((prev) => [...prev, 'Connected.']);
+    };
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'chat_message') {
+          setIncomingChats((prev) => [...prev, { from: data.from, message: data.message }]);
+          setLiveMessages((prev) => [...prev, `New message from ${data.from}: ${data.message}`]);
+        } else if (data.type === 'chat_response') {
+          setLiveMessages((prev) => [...prev, `${data.sender}: ${data.message}`]);
+        } else if (data.type === 'order_update') {
+          setLiveMessages((prev) => [...prev, `Order update: status → ${data.status}`]);
+          // Bump this counter so the Orders tab (mounted or not) refetches
+          // the next time it's visible / re-renders.
+          setOrdersRefreshKey((k) => k + 1);
+          pushLog(`Live order update received — status: ${data.status}`);
+        } else {
+          setLiveMessages((prev) => [...prev, JSON.stringify(data)]);
+        }
+      } catch {
+        setLiveMessages((prev) => [...prev, event.data]);
+      }
+    };
+    ws.onclose = () => {
+      setWsConnected(false);
+      wsRef.current = null;
+      pushLog('WebSocket disconnected');
+      setLiveMessages((prev) => [...prev, 'Disconnected.']);
+    };
+    ws.onerror = () => {
+      pushLog('WebSocket error');
+    };
+
+    wsRef.current = ws;
+  }, [auth.accessToken, pushLog]);
+
+  const disconnectWebSocket = useCallback(() => {
+    wsRef.current?.close();
+    wsRef.current = null;
+  }, []);
+
+  const sendWsMessage = useCallback((payload: object) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(payload));
+    }
+  }, []);
+
+  // Auto-connect once logged in (and once session restore has settled),
+  // auto-disconnect on logout.
+  useEffect(() => {
+    if (restoringSession) return;
+    if (auth.accessToken && !wsRef.current) {
+      connectWebSocket();
+    } else if (!auth.accessToken && wsRef.current) {
+      disconnectWebSocket();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auth.accessToken, restoringSession]);
+
+  useEffect(() => {
+    return () => {
+      wsRef.current?.close();
+    };
+  }, []);
+
   function handleLoginSuccess(accessToken: string, refreshToken: string, user: UserProfile) {
     window.localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
     setAuth({ accessToken, user });
@@ -426,6 +519,9 @@ export default function ApiConsolePage() {
     } catch {
       // even if the server call fails, still clear the local session
     }
+    disconnectWebSocket();
+    setLiveMessages([]);
+    setIncomingChats([]);
     window.localStorage.removeItem(REFRESH_TOKEN_KEY);
     setAuth({ accessToken: null, user: null });
     pushLog('Logged out');
@@ -453,6 +549,7 @@ export default function ApiConsolePage() {
             return (
               <button
                 key={item.id}
+                type="button"
                 onClick={() => changeTab(item.id)}
                 className={`block w-full rounded-md px-3 py-2 text-left text-sm transition ${
                   tab === item.id
@@ -466,8 +563,14 @@ export default function ApiConsolePage() {
           })}
         </nav>
 
-        <div className="border-t border-slate-200 p-3">
+        <div className="border-t border-slate-200 p-3 space-y-1">
           <StatusDot health={health} />
+          {auth.accessToken && (
+            <div className="flex items-center gap-2 font-mono text-xs tracking-wide text-slate-400">
+              <span className={`h-2 w-2 rounded-full ${wsConnected ? 'bg-teal-500' : 'bg-slate-300'}`} />
+              {wsConnected ? 'Live updates on' : 'Live updates off'}
+            </div>
+          )}
         </div>
       </aside>
 
@@ -505,13 +608,25 @@ export default function ApiConsolePage() {
           {tab === 'categories' && <CategoriesTab auth={auth} pushLog={pushLog} />}
           {tab === 'products' && <ProductsTab auth={auth} pushLog={pushLog} />}
           {tab === 'cart' && auth.accessToken && <CartTab auth={auth} pushLog={pushLog} />}
-          {tab === 'orders' && auth.accessToken && <OrdersTab auth={auth} pushLog={pushLog} />}
+          {tab === 'orders' && auth.accessToken && (
+            <OrdersTab auth={auth} pushLog={pushLog} refreshKey={ordersRefreshKey} />
+          )}
           {tab === 'payments' && auth.accessToken && <PaymentsTab auth={auth} pushLog={pushLog} />}
           {tab === 'reviews' && <ReviewsTab auth={auth} pushLog={pushLog} />}
           {tab === 'users' && auth.accessToken && auth.user?.is_superuser && (
             <UsersTab auth={auth} pushLog={pushLog} />
           )}
-          {tab === 'live' && auth.accessToken && <LiveTab auth={auth} pushLog={pushLog} />}
+          {tab === 'live' && auth.accessToken && (
+            <LiveTab
+              auth={auth}
+              connected={wsConnected}
+              messages={liveMessages}
+              incoming={incomingChats}
+              onConnect={connectWebSocket}
+              onDisconnect={disconnectWebSocket}
+              onSend={sendWsMessage}
+            />
+          )}
         </main>
       </div>
     </div>
@@ -626,6 +741,7 @@ function AuthTab({
         {(['login', 'register'] as const).map((m) => (
           <button
             key={m}
+            type="button"
             onClick={() => setMode(m)}
             className={`flex-1 rounded px-3 py-1.5 capitalize transition ${
               mode === m ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'
@@ -639,6 +755,7 @@ function AuthTab({
         {mode === 'register' && (
           <Field
             label="Full name"
+            name="full_name"
             value={form.full_name}
             onChange={(e) => setForm({ ...form, full_name: e.target.value })}
             required
@@ -646,6 +763,7 @@ function AuthTab({
         )}
         <Field
           label="Email"
+          name="email"
           type="email"
           value={form.email}
           onChange={(e) => setForm({ ...form, email: e.target.value })}
@@ -653,6 +771,7 @@ function AuthTab({
         />
         <Field
           label="Password"
+          name="password"
           type="password"
           value={form.password}
           onChange={(e) => setForm({ ...form, password: e.target.value })}
@@ -721,6 +840,7 @@ function CategoriesTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string
         action={
           auth.user?.is_superuser && (
             <button
+              type="button"
               onClick={() => setShowForm((v) => !v)}
               className="font-mono text-xs text-teal-700 underline decoration-dotted hover:text-teal-900"
             >
@@ -737,12 +857,14 @@ function CategoriesTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string
           <form onSubmit={handleCreate} className="space-y-3">
             <Field
               label="Name"
+              name="category_name"
               value={form.name}
               onChange={(e) => setForm({ ...form, name: e.target.value })}
               required
             />
             <TextArea
               label="Description"
+              name="category_description"
               value={form.description}
               onChange={(e) => setForm({ ...form, description: e.target.value })}
               rows={2}
@@ -778,6 +900,7 @@ function CategoriesTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string
 // ---------------------------------------------------------------------------
 // Products
 // ---------------------------------------------------------------------------
+
 function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) => void }) {
   const [products, setProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(false);
@@ -889,6 +1012,7 @@ function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) 
         action={
           auth.user?.is_superuser && (
             <button
+              type="button"
               onClick={() => setShowForm((v) => !v)}
               className="font-mono text-xs text-teal-700 underline decoration-dotted hover:text-teal-900"
             >
@@ -909,12 +1033,14 @@ function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) 
             </p>
             <Field
               label="Name"
+              name="product_name"
               value={form.name}
               onChange={(e) => setForm({ ...form, name: e.target.value })}
               required
             />
             <Field
               label="Category ID"
+              name="category_id"
               type="number"
               value={form.category_id}
               onChange={(e) => setForm({ ...form, category_id: e.target.value })}
@@ -922,6 +1048,7 @@ function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) 
             />
             <Field
               label="Price"
+              name="price"
               type="number"
               step="0.01"
               min="0.01"
@@ -931,6 +1058,7 @@ function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) 
             />
             <Field
               label="Stock"
+              name="stock"
               type="number"
               min="0"
               value={form.stock}
@@ -940,6 +1068,7 @@ function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) 
             <div className="col-span-full">
               <TextArea
                 label="Description"
+                name="product_description"
                 value={form.description}
                 onChange={(e) => setForm({ ...form, description: e.target.value })}
                 rows={2}
@@ -973,7 +1102,11 @@ function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) 
                 <div className="mb-3 space-y-2">
                   <div className="flex gap-2 overflow-x-auto pb-2">
                     {p.images.map((img) => (
-                      <div key={img.id} className="relative shrink-0">
+                      // "group" lets the hover-action overlay live INSIDE this
+                      // box (inset-0), so it can never spill into content
+                      // below (like the Upload image button) regardless of
+                      // spacing/overflow quirks.
+                      <div key={img.id} className="group relative h-24 w-24 shrink-0">
                         <img
                           src={`${API_URL.replace('/api/v1', '')}${img.image_url}`}
                           alt={p.name}
@@ -987,18 +1120,20 @@ function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) 
                           </Badge>
                         )}
                         {auth.user?.is_superuser && (
-                          <div className="absolute -bottom-7 left-0 right-0 flex justify-center gap-1 pointer-events-none">
+                          <div className="absolute inset-x-0 bottom-0 flex justify-center gap-1 rounded-b-md bg-gradient-to-t from-black/70 to-transparent p-1 opacity-0 transition-opacity group-hover:opacity-100">
                             {!img.is_primary && (
                               <button
+                                type="button"
                                 onClick={() => handleSetPrimaryImage(img.id, p.id)}
-                                className="pointer-events-auto rounded bg-teal-600 px-2 py-1 text-[9px] font-medium text-white hover:bg-teal-700"
+                                className="rounded bg-teal-600 px-1.5 py-0.5 text-[9px] font-medium text-white hover:bg-teal-700"
                               >
-                                Set Primary
+                                Primary
                               </button>
                             )}
                             <button
+                              type="button"
                               onClick={() => handleDeleteImage(img.id, p.id)}
-                              className="pointer-events-auto rounded bg-rose-600 px-2 py-1 text-[9px] font-medium text-white hover:bg-rose-700"
+                              className="rounded bg-rose-600 px-1.5 py-0.5 text-[9px] font-medium text-white hover:bg-rose-700"
                             >
                               Delete
                             </button>
@@ -1007,7 +1142,7 @@ function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) 
                       </div>
                     ))}
                   </div>
-                  {auth.user?.is_superuser && p.images.length > 0 && (
+                  {auth.user?.is_superuser && (
                     <p className="text-[9px] text-slate-400">Hover over images for actions</p>
                   )}
                 </div>
@@ -1025,7 +1160,7 @@ function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) 
               </div>
 
               {auth.user?.is_superuser && (
-                <div className="mt-3 border-t border-slate-100 pt-3">
+                <div className="relative z-10 mt-3 border-t border-slate-100 pt-3">
                   {uploadTarget === p.id ? (
                     <div className="space-y-2">
                       <input
@@ -1045,6 +1180,7 @@ function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) 
                       {uploadError && <Alert kind="error">{uploadError}</Alert>}
                       <div className="flex gap-2">
                         <Button
+                          type="button"
                           variant="ghost"
                           className="!px-3 !py-1 text-xs"
                           onClick={() => handleUpload(p.id)}
@@ -1053,6 +1189,7 @@ function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) 
                           Upload
                         </Button>
                         <Button
+                          type="button"
                           variant="ghost"
                           className="!px-3 !py-1 text-xs"
                           onClick={() => {
@@ -1066,8 +1203,9 @@ function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) 
                     </div>
                   ) : (
                     <button
+                      type="button"
                       onClick={() => setUploadTarget(p.id)}
-                      className="font-mono text-[11px] text-teal-700 underline decoration-dotted"
+                      className="relative z-10 font-mono text-[11px] text-teal-700 underline decoration-dotted"
                     >
                       Upload image
                     </button>
@@ -1081,6 +1219,7 @@ function ProductsTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) 
     </div>
   );
 }
+
 // ---------------------------------------------------------------------------
 // Cart
 // ---------------------------------------------------------------------------
@@ -1253,7 +1392,15 @@ function CartTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) => v
 // Orders
 // ---------------------------------------------------------------------------
 
-function OrdersTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) => void }) {
+function OrdersTab({
+  auth,
+  pushLog,
+  refreshKey,
+}: {
+  auth: AuthState;
+  pushLog: (s: string) => void;
+  refreshKey: number;
+}) {
   const [myOrders, setMyOrders] = useState<Order[]>([]);
   const [allOrders, setAllOrders] = useState<Order[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
@@ -1287,12 +1434,24 @@ function OrdersTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) =>
     }
   }, [auth.accessToken, auth.user?.is_superuser, pushLog]);
 
+  // Initial load
   useEffect(() => {
     loadMyOrders();
     apiFetch<Product[]>('/products/?limit=50')
       .then(setProducts)
       .catch(() => {});
   }, [loadMyOrders]);
+
+  // Refetch automatically whenever a live order_update broadcast arrives
+  // (refreshKey is bumped at the top-level WebSocket handler), regardless
+  // of whether the user is looking at this tab when the update happens or
+  // switches to it afterward.
+  useEffect(() => {
+    if (refreshKey === 0) return; // skip on initial mount, already loaded above
+    loadMyOrders();
+    if (showAdmin) loadAllOrders();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey]);
 
   function addItem() {
     if (!selectedProduct) return;
@@ -1441,6 +1600,7 @@ function OrdersTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) =>
           <SectionTitle
             action={
               <button
+                type="button"
                 onClick={() => {
                   setShowAdmin((v) => !v);
                   if (!showAdmin) loadAllOrders();
@@ -1469,7 +1629,7 @@ function OrdersTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) =>
                     <p className="mt-1 font-mono text-[11px] text-slate-400">${o.total_price}</p>
                     <div className="mt-2 flex items-center gap-2">
                       <select
-                        defaultValue={o.status}
+                        value={o.status}
                         onChange={(e) => handleStatusUpdate(o.id, e.target.value)}
                         className="rounded-md border border-slate-300 px-2 py-1 text-xs"
                       >
@@ -1836,86 +1996,44 @@ function UsersTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) => 
 }
 
 // ---------------------------------------------------------------------------
-// Live (WebSocket)
+// Live (WebSocket) — now a "dumb" component driven by props. The actual
+// connection lives at the top level (ApiConsolePage) so it persists across
+// tab switches.
 // ---------------------------------------------------------------------------
 
-function LiveTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) => void }) {
+function LiveTab({
+  auth,
+  connected,
+  messages,
+  incoming,
+  onConnect,
+  onDisconnect,
+  onSend,
+}: {
+  auth: AuthState;
+  connected: boolean;
+  messages: string[];
+  incoming: IncomingChat[];
+  onConnect: () => void;
+  onDisconnect: () => void;
+  onSend: (payload: object) => void;
+}) {
   const isAdmin = !!auth.user?.is_superuser;
-
-  const [connected, setConnected] = useState(false);
-  const [messages, setMessages] = useState<string[]>([]);
   const [chatInput, setChatInput] = useState('');
-  const [incoming, setIncoming] = useState<{ from: string; message: string }[]>([]);
-  const [replyTarget, setReplyTarget] = useState<string>('');
+  const [replyTarget, setReplyTarget] = useState('');
   const [replyText, setReplyText] = useState('');
-  const wsRef = useRef<WebSocket | null>(null);
-
-  function connect() {
-    if (!auth.accessToken || wsRef.current) return;
-    const wsBase = API_URL.replace(/^http/, 'ws');
-    const ws = new WebSocket(`${wsBase}/ws?token=${auth.accessToken}`);
-
-    ws.onopen = () => {
-      setConnected(true);
-      pushLog('WebSocket connected');
-      setMessages((prev) => [...prev, 'Connected.']);
-    };
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === 'chat_message') {
-          // Only admins receive this — a customer's support message
-          setIncoming((prev) => [...prev, { from: data.from, message: data.message }]);
-          setMessages((prev) => [...prev, `New message from ${data.from}: ${data.message}`]);
-        } else if (data.type === 'chat_response') {
-          // A customer receiving the admin's reply
-          setMessages((prev) => [...prev, `${data.sender}: ${data.message}`]);
-        } else if (data.type === 'order_update') {
-          setMessages((prev) => [...prev, `Order update: status → ${data.status}`]);
-        } else {
-          setMessages((prev) => [...prev, JSON.stringify(data)]);
-        }
-      } catch {
-        setMessages((prev) => [...prev, event.data]);
-      }
-    };
-    ws.onclose = () => {
-      setConnected(false);
-      wsRef.current = null;
-      pushLog('WebSocket disconnected');
-      setMessages((prev) => [...prev, 'Disconnected.']);
-    };
-    ws.onerror = () => {
-      pushLog('WebSocket error');
-    };
-
-    wsRef.current = ws;
-  }
-
-  function disconnect() {
-    wsRef.current?.close();
-    wsRef.current = null;
-  }
-
-  useEffect(() => {
-    return () => {
-      wsRef.current?.close();
-    };
-  }, []);
 
   function sendChat(e: React.FormEvent) {
     e.preventDefault();
-    if (!wsRef.current || !chatInput.trim()) return;
-    wsRef.current.send(JSON.stringify({ type: 'chat', message: chatInput }));
-    setMessages((prev) => [...prev, `You: ${chatInput}`]);
+    if (!chatInput.trim()) return;
+    onSend({ type: 'chat', message: chatInput });
     setChatInput('');
   }
 
   function sendReply(e: React.FormEvent) {
     e.preventDefault();
-    if (!wsRef.current || !replyTarget || !replyText.trim()) return;
-    wsRef.current.send(JSON.stringify({ type: 'chat_reply', to: replyTarget, message: replyText }));
-    setMessages((prev) => [...prev, `You → ${replyTarget}: ${replyText}`]);
+    if (!replyTarget || !replyText.trim()) return;
+    onSend({ type: 'chat_reply', to: replyTarget, message: replyText });
     setReplyText('');
   }
 
@@ -1924,11 +2042,11 @@ function LiveTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) => v
       <SectionTitle
         action={
           connected ? (
-            <Button variant="ghost" onClick={disconnect}>
+            <Button variant="ghost" onClick={onDisconnect}>
               Disconnect
             </Button>
           ) : (
-            <Button onClick={connect}>Connect</Button>
+            <Button onClick={onConnect}>Connect</Button>
           )
         }
       >
@@ -1945,7 +2063,7 @@ function LiveTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) => v
         <div className="mb-3 h-64 space-y-1 overflow-y-auto rounded-md bg-slate-900 p-3 font-mono text-[11px] text-slate-300">
           {messages.length === 0 ? (
             <p className="text-slate-500">
-              No messages yet. Connect, then {isAdmin ? 'wait for a customer message' : 'send a message below'}.
+              No messages yet. {isAdmin ? 'Waiting for a customer message.' : 'Send a message below.'}
             </p>
           ) : (
             messages.map((m, i) => <p key={i}>{m}</p>)
@@ -1965,6 +2083,7 @@ function LiveTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) => v
                       <span className="font-mono text-slate-400">{msg.from}:</span> {msg.message}
                     </span>
                     <button
+                      type="button"
                       onClick={() => setReplyTarget(msg.from)}
                       className="font-mono text-[11px] text-teal-700 underline decoration-dotted"
                     >
@@ -2012,8 +2131,8 @@ function LiveTab({ auth, pushLog }: { auth: AuthState; pushLog: (s: string) => v
         <p className="mt-2 font-mono text-[11px] text-slate-400">
           {isAdmin
             ? 'Messages from any connected customer appear above. Reply by entering their email and a message.'
-            : 'An admin must be connected on their Live tab to see and reply to your message.'}
-          {' '}Order status changes will also appear here in real time.
+            : 'An admin must be connected for their Live tab to see and reply to your message.'}
+          {' '}Order status changes appear here — and on the Orders tab — in real time, automatically.
         </p>
       </Card>
     </div>
